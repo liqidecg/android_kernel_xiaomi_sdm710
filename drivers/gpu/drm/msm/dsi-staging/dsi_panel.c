@@ -932,7 +932,20 @@ static u32 dsi_panel_get_backlight(struct dsi_panel *panel)
 	return panel->bl_config.bl_level;
 }
 
-int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl);
+static int dsi_panel_adj_dc_backlight(struct dsi_panel *panel, bool status)
+{
+	u32 bl_lvl = dsi_panel_get_backlight(panel);
+	int rc;
+
+	if (status && !panel->doze_status)
+		bl_lvl = max(bl_lvl, panel->bl_config.bl_dc_thresh);
+
+	rc = dsi_panel_update_backlight(panel, bl_lvl);
+	if (rc)
+		pr_err("Failed to update backlight\n");
+
+	return rc;
+}
 
 enum msm_dim_layer_type dsi_panel_update_dimlayer(struct dsi_panel *panel,
 						  enum msm_dim_layer_type type,
@@ -957,21 +970,11 @@ enum msm_dim_layer_type dsi_panel_update_dimlayer(struct dsi_panel *panel,
 			dsi_panel_set_hbm(panel, true);
 	}
 	else if (panel->dimlayer_type == MSM_DIM_LAYER_FOD) {
-		if (!panel->doze_status) {
-			/* Switch to normal mode */
+		/* Switch to normal mode */
 
-			/* Switch-off HBM if it is not enabled by user */
-			if (!panel->hbm_enabled)
-				dsi_panel_set_hbm(panel, false);
-		} else {
-			/* Switch back to doze mode */
-			if (panel->hbm_enabled)
-				DSI_PANEL_SEND(panel,
-					       DISP_HBM_FOD_OFF_DOZE_HBM_ON);
-			else
-				DSI_PANEL_SEND(panel,
-					       DISP_HBM_FOD_OFF_DOZE_LBM_ON);
-		}
+		/* Switch-off HBM if it is not enabled by user */
+		if (!panel->hbm_enabled)
+			dsi_panel_set_hbm(panel, false);
 	}
 	else if (panel->dimlayer_type == MSM_DIM_LAYER_TOP ||
 		 type == MSM_DIM_LAYER_TOP) {
@@ -995,10 +998,8 @@ no_type_change:
 	}
 
 	/* Adjust DC backlight if necessary */
-	if (adjust_bl){
-		u32 bl_lvl = dsi_panel_get_backlight(panel);
-		dsi_panel_set_backlight(panel, bl_lvl);
-	}
+	if (adjust_bl)
+		dsi_panel_adj_dc_backlight(panel, panel->dc_dimming);
 
 	dsi_panel_release_panel_lock(panel);
 
@@ -1057,9 +1058,6 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 			 * backlight level.
 			 */
 			bl_lvl = DIV_ROUND_CLOSEST(bl_lvl * hw_bl_lvl, brightness);
-
-			/* Make sure backlight level is above threshold */
-			bl_lvl = max(bl->bl_dc_thresh, bl_lvl);
 		}
 	}
 
@@ -2015,8 +2013,6 @@ const char *cmd_set_prop_map[DSI_CMD_SET_MAX] = {
 	"ROI not parsed from DTSI, generated dynamically",
 	"qcom,mdss-dsi-timing-switch-command",
 	"qcom,mdss-dsi-post-mode-switch-on-command",
-	"qcom,mdss-dsi-dispparam-hbm-fod-off-doze-hbm-on-command",
-	"qcom,mdss-dsi-dispparam-hbm-fod-off-doze-lbm-on-command",
 	"qcom,mdss-dsi-dispparam-hbm-on-command",
 	"qcom,mdss-dsi-dispparam-hbm-off-command",
 };
@@ -2043,8 +2039,6 @@ const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
 	"ROI not parsed from DTSI, generated dynamically",
 	"qcom,mdss-dsi-timing-switch-command-state",
 	"qcom,mdss-dsi-post-mode-switch-on-command-state",
-	"qcom,mdss-dsi-dispparam-hbm-fod-off-doze-hbm-on-command-state",
-	"qcom,mdss-dsi-dispparam-hbm-fod-off-doze-lbm-on-command-state",
 	"qcom,mdss-dsi-dispparam-hbm-on-command-state",
 	"qcom,mdss-dsi-dispparam-hbm-off-command-state",
 };
@@ -4223,8 +4217,6 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 
 int dsi_panel_set_nolp(struct dsi_panel *panel)
 {
-	panel->doze_status = false;
-
 	int rc = 0;
 
 	if (!panel) {
@@ -4236,10 +4228,18 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 		return 0;
 
 	mutex_lock(&panel->panel_lock);
+
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_NOLP);
 	if (rc)
 		pr_err("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
 		       panel->name, rc);
+
+	/* Adjust doze brightness using dts nodes.
+	 * Update one last time right after command was sent
+	 * to mitigate flickering.
+	 */
+	u32 bl_lvl = dsi_panel_get_backlight(panel);
+	dsi_panel_update_backlight(panel, bl_lvl);
 
 	/* Restore HBM mode when it is enabled by user */
 	if (panel->hbm_enabled) {
@@ -4250,6 +4250,9 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 	}
 
 	mutex_unlock(&panel->panel_lock);
+
+	panel->doze_status = false;
+
 	return rc;
 }
 
